@@ -166,22 +166,34 @@ def color_avail(val):
 
 
 def styled_avail_df(df, avail_cols):
+
     def highlight(val):
         try:
             v = float(val)
             if v >= 99:
                 return "background-color:#d1fae5;color:#065f46"
-            if v >= 97:
+            elif v >= 97:
                 return "background-color:#fef3c7;color:#92400e"
-            if v >= 95:
+            elif v >= 95:
                 return "background-color:#ffedd5;color:#9a3412"
-            return "background-color:#fee2e2;color:#991b1b"
+            else:
+                return "background-color:#fee2e2;color:#991b1b"
         except Exception:
             return ""
+
     existing = [c for c in avail_cols if c in df.columns]
+
+    styler = df.style
+
     if existing:
-        return df.style.applymap(highlight, subset=existing)
-    return df.style
+        try:
+            # Pandas >=2.1
+            styler = styler.map(highlight, subset=existing)
+        except Exception:
+            # Older pandas
+            styler = styler.applymap(highlight, subset=existing)
+
+    return styler
 
 
 # ──────────────────────────────────────────────────────────────
