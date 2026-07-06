@@ -865,16 +865,23 @@ def build_html_report(ssa, target_period, base_period, threshold,
                         hover_data=["Events", "Sites_Affected", "Time_Window", "Affected_SDCA", "Probable_Cause"])
         chart_daily_html = plot_to_html(fig_dt, height=450)
 
-        # 🔧 FIXED: was clustered.head(15) — a single global top-15 by Total_Hours,
-        # which one dominant fault group (e.g. EB Supply) would monopolize entirely,
-        # hiding every other fault group from this table. Now take the top 3
-        # clusters PER fault group (capped so the table stays readable) so all
-        # groups with meaningful outages are represented for troubleshooting.
-        top_per_group = (
-            clustered.groupby("fault_group", group_keys=False)
-            .apply(lambda g: g.nlargest(3, "Total_Hours"))
-            .sort_values(["fault_group", "Total_Hours"], ascending=[True, False])
-        )
+        # 🔧 FIXED (v2): the previous groupby("fault_group").apply(lambda g:
+        # g.nlargest(...)) pattern is fragile across pandas versions — on some
+        # versions (e.g. the pandas build on Streamlit Cloud's py3.14 image)
+        # .apply() can silently drop the "fault_group" grouping column from the
+        # result, causing `KeyError: 'fault_group'` on the sort_values below.
+        # Replaced with sort_values() + groupby().head(), which is a much more
+        # stable/standard way to get "top N rows per group" and never drops
+        # the group column since no lambda/apply is involved.
+        if clustered.empty:
+            top_per_group = clustered
+        else:
+            top_per_group = (
+                clustered.sort_values(["fault_group", "Total_Hours"], ascending=[True, False])
+                .groupby("fault_group", as_index=False)
+                .head(3)
+                .sort_values(["fault_group", "Total_Hours"], ascending=[True, False])
+            )
 
         tbl = """<div style='margin-top:20px; overflow-x:auto;'><h4 style='color:#1e5799;margin-bottom:10px'>Clustered Outages for Troubleshooting (Top 3 per Fault Group)</h4>
         <table style='width:100%;font-size:13px; border-collapse: collapse;'><thead><tr style='background:#f8fafc; color:#1e293b; border-bottom: 2px solid #cbd5e1;'>
