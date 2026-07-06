@@ -873,14 +873,9 @@ def build_html_report(ssa, target_period, base_period, threshold,
         top_per_group = (
             clustered.groupby("fault_group", group_keys=False)
             .apply(lambda g: g.nlargest(3, "Total_Hours"))
-            .reset_index(drop=True)
+            .sort_values(["fault_group", "Total_Hours"], ascending=[True, False])
         )
 
-        top_per_group = top_per_group.sort_values(
-            by=["fault_group", "Total_Hours"],
-            ascending=[True, False]
-        )
- 
         tbl = """<div style='margin-top:20px; overflow-x:auto;'><h4 style='color:#1e5799;margin-bottom:10px'>Clustered Outages for Troubleshooting (Top 3 per Fault Group)</h4>
         <table style='width:100%;font-size:13px; border-collapse: collapse;'><thead><tr style='background:#f8fafc; color:#1e293b; border-bottom: 2px solid #cbd5e1;'>
         <th style='padding:8px; text-align:left;'>Date</th><th style='padding:8px; text-align:left;'>Fault Group</th>
