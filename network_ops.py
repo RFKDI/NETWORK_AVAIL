@@ -630,6 +630,104 @@ def alarm_daily_trend(df):
     )
 
 
+def get_repeat_failure_reports(df, top_n=15):
+    """
+    Identifies 'repeat failure' sites — sites with >=2 alarm events in the
+    uploaded period — then rolls them up three ways:
+      1. Site-wise: the actual list of repeat-offender sites, worst case
+         (most instances) first
+      2. SDCA-wise: which SDCAs have the most chronic/recurring failures
+      3. Technology-wise (Vendor + BTS Type): which tech stack is failing repeatedly
+    Returns (df_repeat_sites, df_repeat_sdca, df_repeat_tech), each capped to top_n rows.
+    """
+    empty = pd.DataFrame()
+    if df is None or df.empty:
+        return empty, empty, empty
+
+    site_col = "bts_name" if "bts_name" in df.columns else "bts_ip_id"
+    if site_col not in df.columns:
+        return empty, empty, empty
+
+    site_events = df.groupby(site_col).size().reset_index(name="Events")
+    repeat_sites = site_events[site_events["Events"] >= 2][site_col]
+    repeat_df = df[df[site_col].isin(repeat_sites)].copy()
+    if repeat_df.empty:
+        return empty, empty, empty
+
+    # Technology tag (Vendor + BTS Type, e.g. "Tejas 4G") — used by both the
+    # site-wise and technology-wise reports
+    if "vendor" in repeat_df.columns and "bts_type" in repeat_df.columns:
+        repeat_df["Technology"] = (
+            repeat_df["vendor"].astype(str).str.strip().str.title()
+            + " " + repeat_df["bts_type"].astype(str).str.strip()
+        )
+    elif "bts_type" in repeat_df.columns:
+        repeat_df["Technology"] = repeat_df["bts_type"].astype(str)
+    elif "vendor" in repeat_df.columns:
+        repeat_df["Technology"] = repeat_df["vendor"].astype(str).str.title()
+    else:
+        repeat_df["Technology"] = "Unknown"
+
+    # 1. Site-wise repeat failures — the actual list of worst offenders
+    agg_kwargs = {
+        "Instances": (site_col, "count"),
+        "Total_Hours": ("down_hours", "sum"),
+        "Avg_Hours_Per_Event": ("down_hours", "mean"),
+    }
+    if "sdca_name" in repeat_df.columns:
+        agg_kwargs["SDCA"] = ("sdca_name", "first")
+    agg_kwargs["Technology"] = ("Technology", "first")
+    if "fault_group" in repeat_df.columns:
+        agg_kwargs["Top_Fault_Cause"] = (
+            "fault_group",
+            lambda s: s.value_counts().idxmax() if not s.empty else "N/A",
+        )
+
+    df_repeat_sites = (
+        repeat_df.groupby(site_col)
+        .agg(**agg_kwargs)
+        .reset_index()
+        .rename(columns={site_col: "Site"})
+        .sort_values(["Instances", "Total_Hours"], ascending=[False, False])
+        .head(top_n)
+    )
+    df_repeat_sites["Total_Hours"] = df_repeat_sites["Total_Hours"].round(2)
+    df_repeat_sites["Avg_Hours_Per_Event"] = df_repeat_sites["Avg_Hours_Per_Event"].round(2)
+
+    # 2. SDCA-wise repeat failures
+    if "sdca_name" in repeat_df.columns:
+        df_repeat_sdca = (
+            repeat_df.groupby("sdca_name")
+            .agg(
+                Repeat_Sites=(site_col, "nunique"),
+                Total_Events=(site_col, "count"),
+                Total_Hours=("down_hours", "sum"),
+            )
+            .reset_index()
+            .sort_values("Total_Events", ascending=False)
+            .head(top_n)
+        )
+        df_repeat_sdca["Total_Hours"] = df_repeat_sdca["Total_Hours"].round(2)
+    else:
+        df_repeat_sdca = empty
+
+    # 3. Technology-wise repeat failures
+    df_repeat_tech = (
+        repeat_df.groupby("Technology")
+        .agg(
+            Repeat_Sites=(site_col, "nunique"),
+            Total_Events=(site_col, "count"),
+            Total_Hours=("down_hours", "sum"),
+        )
+        .reset_index()
+        .sort_values("Total_Events", ascending=False)
+        .head(top_n)
+    )
+    df_repeat_tech["Total_Hours"] = df_repeat_tech["Total_Hours"].round(2)
+
+    return df_repeat_sites, df_repeat_sdca, df_repeat_tech
+
+
 # ──────────────────────────────────────────────────────────────
 # HTML EXPORT
 # ──────────────────────────────────────────────────────────────
@@ -659,7 +757,8 @@ def build_html_report(ssa, target_period, base_period, threshold,
                       total_sites=0, avg_2g=0, avg_3g=0, avg_4g=0,
                       sites_below_97=0, total_outage_hrs=0, power_eb_hrs=0,
                       overall_avail=0.0, total_nodes=0, band_700=0, band_2100=0, band_2500=0,
-                      tech_nodes=None, df_avail_dist=None):
+                      tech_nodes=None, df_avail_dist=None,
+                      df_repeat_sites=None, df_repeat_sdca=None, df_repeat_tech=None):
     import plotly.graph_objects as go
     import plotly.express as px
     from datetime import datetime
@@ -759,20 +858,32 @@ def build_html_report(ssa, target_period, base_period, threshold,
         clustered["Time_Window"] = clustered["time_block"].dt.strftime("%H:%M") + " - " + (
                     clustered["time_block"] + pd.Timedelta(hours=4)).dt.strftime("%H:%M")
         clustered = clustered.sort_values("Total_Hours", ascending=False)
+        # 🔧 FIXED (see note below the table build for full explanation)
 
         fig_dt = px.bar(clustered, x="date", y="Total_Hours", color="fault_group", color_discrete_map=FAULT_COLORS,
                         title="Daily Outage Hours (Clustered by 4-hr Windows)", barmode="stack",
                         hover_data=["Events", "Sites_Affected", "Time_Window", "Affected_SDCA", "Probable_Cause"])
         chart_daily_html = plot_to_html(fig_dt, height=450)
 
-        tbl = """<div style='margin-top:20px; overflow-x:auto;'><h4 style='color:#1e5799;margin-bottom:10px'>Clustered Outages for Troubleshooting</h4>
+        # 🔧 FIXED: was clustered.head(15) — a single global top-15 by Total_Hours,
+        # which one dominant fault group (e.g. EB Supply) would monopolize entirely,
+        # hiding every other fault group from this table. Now take the top 3
+        # clusters PER fault group (capped so the table stays readable) so all
+        # groups with meaningful outages are represented for troubleshooting.
+        top_per_group = (
+            clustered.groupby("fault_group", group_keys=False)
+            .apply(lambda g: g.nlargest(3, "Total_Hours"))
+            .sort_values(["fault_group", "Total_Hours"], ascending=[True, False])
+        )
+
+        tbl = """<div style='margin-top:20px; overflow-x:auto;'><h4 style='color:#1e5799;margin-bottom:10px'>Clustered Outages for Troubleshooting (Top 3 per Fault Group)</h4>
         <table style='width:100%;font-size:13px; border-collapse: collapse;'><thead><tr style='background:#f8fafc; color:#1e293b; border-bottom: 2px solid #cbd5e1;'>
         <th style='padding:8px; text-align:left;'>Date</th><th style='padding:8px; text-align:left;'>Fault Group</th>
         <th style='padding:8px; text-align:left;'>Time Window</th><th style='padding:8px; text-align:center;'>Events</th>
         <th style='padding:8px; text-align:center;'>Sites</th><th style='padding:8px; text-align:center;'>Total Hours</th>
         <th style='padding:8px; text-align:left;'>Affected SDCA</th><th style='padding:8px; text-align:left;'>Probable Cause</th>
         </tr></thead><tbody>"""
-        for _, row in clustered.head(15).iterrows():
+        for _, row in top_per_group.iterrows():
             tbl += f"""<tr style='border-bottom: 1px solid #e2e8f0;'><td style='padding:8px;'>{row['date']}</td>
             <td style='padding:8px;'><span style='color:{FAULT_COLORS.get(row["fault_group"], "#94a3b8")};font-weight:600'>{row["fault_group"]}</span></td>
             <td style='padding:8px;'>{row["Time_Window"]}</td><td style='padding:8px; text-align:center;'>{row["Events"]}</td>
@@ -943,18 +1054,120 @@ tr:hover td{background:#f8fafc}
         tab4_sdca_html += "</tbody></table></div>"
 
     # 7. Tab 4 Detail Breakdown (tab4_detail_html)
+    # 🔧 FIXED: the Streamlit "Fault Analysis" tab shows, per fault group, BOTH a
+    # raw fault-type summary AND the full list of individual alarm/site records
+    # (bts_name, vendor, fault_type, down/up times, down_hours, sdca_name).
+    # The HTML export previously only rendered the fault-type summary table and
+    # silently dropped the site-level "Alarm records" list. Added below so the
+    # executive HTML report matches the in-app view exactly.
     tab4_detail_html = ""
     if not df_alarm_ssa.empty and "fault_type" in df_alarm_ssa.columns:
         tab4_detail_html = "<div class='section'><h3>Detailed Fault Type Breakdown (within each Group)</h3>"
+        detail_cols = [
+            c for c in
+            ["bts_name", "bts_type", "vendor", "fault_type",
+             "bts_down_dt", "bts_up_dt", "down_hours", "sdca_name"]
+            if c in df_alarm_ssa.columns
+        ]
+        detail_col_labels = {
+            "bts_name": "BTS Name", "bts_type": "Type", "vendor": "Vendor",
+            "fault_type": "Fault Type", "bts_down_dt": "Down At", "bts_up_dt": "Up At",
+            "down_hours": "Down Hrs", "sdca_name": "SDCA",
+        }
         for grp, sub_df in df_alarm_ssa.groupby("fault_group"):
+            gc = FAULT_COLORS.get(grp, "#1e293b")
             type_summary = sub_df.groupby("fault_type").agg(Events=("fault_type", "count"), Total_Hours=(
             "down_hours", "sum")).reset_index().sort_values("Total_Hours", ascending=False)
-            tab4_detail_html += f"<h4 style='color:{FAULT_COLORS.get(grp, '#1e293b')}; margin-top:15px; border-bottom:1px solid #e2e8f0; padding-bottom:5px;'>{grp}</h4>"
+
+            header = f"{grp} — {len(sub_df)} events / {round(sub_df['down_hours'].sum(), 2)}h"
+            tab4_detail_html += f"<h4 style='color:{gc}; margin-top:20px; border-bottom:1px solid #e2e8f0; padding-bottom:5px;'>{header}</h4>"
+
+            tab4_detail_html += "<p style='font-size:12px;font-weight:700;color:#475569;margin:8px 0 4px;'>Raw fault types in this group:</p>"
             tab4_detail_html += "<table style='font-size:12px;'><thead><tr style='background:#f8fafc;'><th style='padding:8px;text-align:left;'>Fault Type</th><th style='padding:8px;text-align:center;'>Events</th><th style='padding:8px;text-align:center;'>Total Hours</th></tr></thead><tbody>"
             for _, row in type_summary.iterrows():
                 tab4_detail_html += f"<tr style='border-bottom:1px solid #f1f5f9;'><td style='padding:8px;'>{row['fault_type']}</td><td style='padding:8px;text-align:center;'>{row['Events']}</td><td style='padding:8px;text-align:center;font-weight:700;'>{row['Total_Hours']:.1f}h</td></tr>"
             tab4_detail_html += "</tbody></table>"
+
+            # ── Alarm records (site list) — previously missing ──────
+            # 🔧 Capped to top 15 by down_hours per group (was showing every
+            # record, which made the report huge for high-volume groups like
+            # EB Supply). A note shows how many more exist beyond the top 15.
+            total_recs = len(sub_df)
+            recs = sub_df[detail_cols].sort_values("down_hours", ascending=False).head(15).reset_index(drop=True)
+            note = f" (showing top 15 of {total_recs} by Down Hours)" if total_recs > 15 else ""
+            tab4_detail_html += f"<p style='font-size:12px;font-weight:700;color:#475569;margin:14px 0 4px;'>Alarm records{note}:</p>"
+            tab4_detail_html += "<div style='overflow-x:auto;'><table style='font-size:11px;'><thead><tr style='background:#f8fafc;'>"
+            for c in detail_cols:
+                tab4_detail_html += f"<th style='padding:6px 8px;text-align:left;'>{detail_col_labels.get(c, c)}</th>"
+            tab4_detail_html += "</tr></thead><tbody>"
+            for _, r in recs.iterrows():
+                tab4_detail_html += "<tr style='border-bottom:1px solid #f1f5f9;'>"
+                for c in detail_cols:
+                    val = r.get(c, "")
+                    if c == "down_hours":
+                        try:
+                            val = f"{float(val):.2f}h"
+                        except Exception:
+                            pass
+                    tab4_detail_html += f"<td style='padding:6px 8px;'>{val}</td>"
+                tab4_detail_html += "</tr>"
+            tab4_detail_html += "</tbody></table></div>"
         tab4_detail_html += "</div>"
+
+    # 7b. Repeat Failures — Site-wise, SDCA-wise & Technology-wise (Top 15 each)
+    # Sites with >=2 alarm events in the uploaded period are treated as
+    # "repeat failures" (chronic/recurring). The site-wise list surfaces the
+    # actual worst-offender sites (most instances first); the SDCA/Technology
+    # roll-ups show WHERE and WHAT tech stack is driving repeat outages.
+    def _repeat_sites_table_html(df_r, title):
+        if df_r is None or df_r.empty:
+            return f"<div class='section'><h3>{title}</h3><p style='color:#64748b;padding:10px'>No repeat-failure sites (2+ events) found.</p></div>"
+        has_sdca = "SDCA" in df_r.columns
+        has_cause = "Top_Fault_Cause" in df_r.columns
+        html_t = f"<div class='section'><h3>{title}</h3>"
+        html_t += "<table><thead><tr><th>Site</th>"
+        if has_sdca: html_t += "<th>SDCA</th>"
+        html_t += "<th>Technology</th><th>Instances</th><th>Total Down Hours</th><th>Avg Hrs / Event</th>"
+        if has_cause: html_t += "<th>Top Fault Cause</th>"
+        html_t += "</tr></thead><tbody>"
+        for _, r in df_r.iterrows():
+            inst = int(r.get("Instances", 0))
+            ic = "#ef4444" if inst >= 5 else "#f97316" if inst >= 3 else "#f59e0b"
+            th = r.get("Total_Hours", 0)
+            grp = str(r.get("Top_Fault_Cause", ""))
+            gc = FAULT_COLORS.get(grp, "#64748b")
+            html_t += f"<tr><td><b>{r.get('Site', '')}</b></td>"
+            if has_sdca: html_t += f"<td>{r.get('SDCA', '')}</td>"
+            html_t += (f"<td>{r.get('Technology', '')}</td>"
+                       f"<td style='text-align:center;color:{ic};font-weight:800'>{inst}</td>"
+                       f"<td style='text-align:center;font-weight:700'>{round(th, 1)}h</td>"
+                       f"<td style='text-align:center'>{round(r.get('Avg_Hours_Per_Event', 0), 1)}h</td>")
+            if has_cause:
+                html_t += f"<td><span style='background:{gc}20;color:{gc};padding:3px 8px;border-radius:4px;font-size:11px;font-weight:600'>{grp}</span></td>"
+            html_t += "</tr>"
+        html_t += "</tbody></table></div>"
+        return html_t
+
+    def _repeat_table_html(df_r, key_col, title):
+        if df_r is None or df_r.empty:
+            return f"<div class='section'><h3>{title}</h3><p style='color:#64748b;padding:10px'>No repeat-failure sites (2+ events) found.</p></div>"
+        html_t = f"<div class='section'><h3>{title}</h3>"
+        html_t += ("<table><thead><tr>"
+                   f"<th>{key_col}</th><th>Repeat Sites</th><th>Total Events</th><th>Total Down Hours</th>"
+                   "</tr></thead><tbody>")
+        for _, r in df_r.iterrows():
+            th = r.get("Total_Hours", 0)
+            thc = "#ef4444" if th > 50 else "#f97316" if th > 20 else "#10b981"
+            html_t += (f"<tr><td><b>{r.get(key_col, '')}</b></td>"
+                       f"<td style='text-align:center'>{int(r.get('Repeat_Sites', 0))}</td>"
+                       f"<td style='text-align:center'>{int(r.get('Total_Events', 0))}</td>"
+                       f"<td style='text-align:center;color:{thc};font-weight:700'>{round(th, 1)}h</td></tr>")
+        html_t += "</tbody></table></div>"
+        return html_t
+
+    tab4_repeat_html = _repeat_sites_table_html(df_repeat_sites, "🔁 Repeat Failures — Site-wise, Worst Case First (Top 15)")
+    tab4_repeat_html += _repeat_table_html(df_repeat_sdca, "SDCA", "🔁 Repeat Failures — SDCA-wise (Top 15)")
+    tab4_repeat_html += _repeat_table_html(df_repeat_tech, "Technology", "🔁 Repeat Failures — Technology-wise (Top 15)")
 
     # 8. Tab 5 Site Ranking (tab5_html)
     tab5_html = "<div class='tab-view c5'><div class='section'><h3>Outage Ranking — All Sites (by Total Down Hours)</h3>"
@@ -1154,6 +1367,7 @@ tr:hover td{background:#f8fafc}
                     </div>
                     {tab4_sdca_html}
                     {tab4_detail_html}
+                    {tab4_repeat_html}
                 </div>
 
                 <!-- Tab 5 -->
@@ -1334,6 +1548,9 @@ if uploaded_alarms:
     else:
         df_alarm_ssa = df_alarm_all.copy() if not df_alarm_all.empty else pd.DataFrame()
 
+# Repeat-failure roll-ups (Site-wise / SDCA-wise / Technology-wise), top 15 each
+df_repeat_sites, df_repeat_sdca, df_repeat_tech = get_repeat_failure_reports(df_alarm_ssa, top_n=15)
+
 # Period resolution
 periods = get_periods(df_nw_raw, selected_ssa)
 if len(periods) == 0:
@@ -1413,16 +1630,16 @@ df_sdca_sum = get_sdca_summary(df_curr)
 
 # ── NEW: Network Summary Metrics ──────────────────────────────────
 # 1. Node Counts by Tech/Vendor
+# 🔧 FIXED: previously this used a separate, looser mask (Vendor + cnt_col > 0,
+# counted by BTS_IP_CLEAN) which gave DIFFERENT numbers from the Vendor Summary
+# tab's get_vendor_summary() (which uses the exact manually cross-checked logic:
+# BCF/WBTS substring match for Nokia, unique BTS Name for Nortel/Tejas, etc.).
+# That mismatch is why "Node Distribution by Technology & Vendor" in Tab 7 and
+# in the HTML export didn't match the (correct) Vendor Summary tab.
+# Now both tabs derive node counts from the SAME source: df_vendor_sum.
 tech_nodes = {}
-masks = {
-    "Nokia 2G":  df_curr["Vendor_Upper"].str.contains("NOKIA", na=False) & (df_curr["2G cnt"].fillna(0) > 0),
-    "Nokia 3G":  df_curr["Vendor_Upper"].str.contains("NOKIA", na=False) & (df_curr["3G cnt"].fillna(0) > 0),
-    "Nortel 2G": df_curr["Vendor_Upper"].str.contains("NORTEL", na=False) & (df_curr["2G cnt"].fillna(0) > 0),
-    "ZTE 3G":    df_curr["Vendor_Upper"].str.contains("ZTE", na=False) & (df_curr["3G cnt"].fillna(0) > 0),
-    "Tejas 4G":  df_curr["Vendor_Upper"].str.contains("TEJAS", na=False) & (df_curr["4G cnt"].fillna(0) > 0),
-}
-for label, mask in masks.items():
-    tech_nodes[label] = df_curr[mask]["BTS_IP_CLEAN"].nunique() if "BTS_IP_CLEAN" in df_curr else len(df_curr[mask])
+if not df_vendor_sum.empty:
+    tech_nodes = dict(zip(df_vendor_sum["Profile"], df_vendor_sum["Sites"]))
 
 # 2. 4G Band-wise Counts
 band_700  = len(df_curr[df_curr["BTS Site ID (700)"].notna() & (df_curr["BTS Site ID (700)"] != "")]) if "BTS Site ID (700)" in df_curr else 0
@@ -1551,7 +1768,8 @@ with col_btn:
             sites_below_97=sites_below_97, total_outage_hrs=total_outage_hrs, power_eb_hrs=power_eb_hrs,
             overall_avail=overall_avail, total_nodes=total_nodes,
             band_700=band_700, band_2100=band_2100, band_2500=band_2500,
-            tech_nodes=tech_nodes, df_avail_dist=df_avail_dist
+            tech_nodes=tech_nodes, df_avail_dist=df_avail_dist,
+            df_repeat_sites=df_repeat_sites, df_repeat_sdca=df_repeat_sdca, df_repeat_tech=df_repeat_tech
         )
         st.download_button(
             label="⬇️ Export HTML",
@@ -2060,6 +2278,39 @@ with tab4:
                     sub[detail_cols].sort_values("down_hours", ascending=False).reset_index(drop=True),
                     use_container_width=True,
                 )
+
+        # ── Repeat Failures — Site-wise, SDCA-wise & Technology-wise ──
+        st.markdown("---")
+        st.subheader("🔁 Repeat Failures")
+        st.caption("Sites with 2 or more alarm events in the uploaded period.")
+
+        st.markdown("**Site-wise — Worst Case First (Top 15 by Instance Count)**")
+        if df_repeat_sites.empty:
+            st.info("No repeat-failure sites (2+ events) found.")
+        else:
+            st.dataframe(
+                df_repeat_sites.rename(columns={
+                    "Instances": "Instances (Events)",
+                    "Total_Hours": "Total Down Hours",
+                    "Avg_Hours_Per_Event": "Avg Hrs / Event",
+                    "Top_Fault_Cause": "Top Fault Cause",
+                }),
+                use_container_width=True,
+            )
+
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.markdown("**SDCA-wise (Top 15)**")
+            if df_repeat_sdca.empty:
+                st.info("No repeat-failure sites (2+ events) found.")
+            else:
+                st.dataframe(df_repeat_sdca, use_container_width=True)
+        with rc2:
+            st.markdown("**Technology-wise (Top 15)**")
+            if df_repeat_tech.empty:
+                st.info("No repeat-failure sites (2+ events) found.")
+            else:
+                st.dataframe(df_repeat_tech, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════
